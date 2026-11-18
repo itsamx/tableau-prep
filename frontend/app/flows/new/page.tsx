@@ -60,6 +60,8 @@ function FlowStudioContent() {
   const searchParams = useSearchParams();
   const flowIdParam = searchParams.get("flowId");
   const { actorEmail } = useActor();
+  const actorEmailRef = useRef(actorEmail);
+  useEffect(() => { actorEmailRef.current = actorEmail; }, [actorEmail]);
 
   // Connection / table sidebar
   const [connections, setConnections] = useState<Connection[]>([]);
@@ -153,8 +155,9 @@ function FlowStudioContent() {
 
   useEffect(() => {
     if (!flowIdParam) return;
+    const email = actorEmailRef.current;
     setIsFlowLoading(true);
-    api.getBackendFlow(actorEmail, flowIdParam)
+    api.getBackendFlow(email, flowIdParam)
       .then((flow) => {
         setCurrentFlow(flow);
         if (flow.connection_id) setSelectedConnectionId(flow.connection_id as string);
@@ -169,10 +172,18 @@ function FlowStudioContent() {
           setNodePositions(flow.node_positions as Record<string, { x: number; y: number }>);
         }
         setHasUnsavedChanges(false);
+        // Materialize sources into Hyper (best-effort, non-blocking)
+        api.hyperOpen(email, flow.flow_id as string).catch(() => {});
       })
       .catch((err) => setError(`Failed to load flow: ${err instanceof ApiError ? err.message : String(err)}`))
       .finally(() => setIsFlowLoading(false));
-  }, [actorEmail, flowIdParam]);
+
+    return () => {
+      // Close the Hyper connection when navigating away; .hyper file is preserved on disk
+      if (flowIdParam) api.hyperClose(actorEmailRef.current, flowIdParam).catch(() => {});
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [flowIdParam]); // actorEmail via ref — changes to email must not re-load the flow
 
   // ── Load tables when connection changes ───────────────────────────────────
 
@@ -555,18 +566,34 @@ function FlowStudioContent() {
     setSelectedNode(node);
     if (!node) { setNodeDataRows(null); return; }
 
-    // Join node → show type-switcher AND fetch data if join is complete
-
     setTimeout(() => previewDrawerRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 50);
 
+    const flowId = currentFlow?.flow_id as string | undefined;
+    const nodeId = (node.alias as string) || (node.id as string) || "";
+
+    // ── Primary path: Hyper preview (lazy-materializes ancestors if needed) ──
+    if (flowId && nodeId) {
+      setIsLoadingNodeData(true);
+      try {
+        const res = await api.hyperNodePreview(actorEmail, flowId, nodeId, 100);
+        if (res?.ok && res.rows?.length) {
+          setNodeDataRows(res.rows);
+          return;
+        }
+      } catch {
+        // Hyper not available (e.g. tableauhyperapi not installed) — fall through
+      } finally {
+        setIsLoadingNodeData(false);
+      }
+    }
+
+    // ── Fallback: live DB via compiled node_sql ───────────────────────────────
     const connId = (currentFlow?.connection_id as string) || selectedConnectionId;
     if (!connId) { setNodeDataRows(null); return; }
 
-    // ── Resolve per-node SQL from the compiled map (works for all flows) ────
     const nodeKey = (node.alias as string) || (node.id as string) || "";
     const nodeSQLEntry = nodeSQL[nodeKey] ?? nodeSQL[node.id as string];
 
-    // Source node: prefer compiled SQL; fall back to raw table sample
     if (node.type === "source" && !nodeSQLEntry) {
       setIsLoadingNodeData(true);
       try {
@@ -579,7 +606,6 @@ function FlowStudioContent() {
       return;
     }
 
-    // Any node with compiled SQL → run it
     if (nodeSQLEntry) {
       setIsLoadingNodeData(true);
       try {
@@ -590,11 +616,10 @@ function FlowStudioContent() {
       return;
     }
 
-    // Output node with no compiled SQL (pure MCP flow, nodeSQL not built) → run saved flow SQL
-    if (node.type === "output" && currentFlow?.flow_id) {
+    if (node.type === "output" && flowId) {
       setIsLoadingNodeData(true);
       try {
-        const res = await api.runBackendFlow(actorEmail, currentFlow.flow_id as string);
+        const res = await api.runBackendFlow(actorEmail, flowId);
         setNodeDataRows(res?.rows?.length ? res.rows : null);
       } catch { setNodeDataRows(null); }
       finally { setIsLoadingNodeData(false); }
@@ -652,6 +677,8 @@ function FlowStudioContent() {
         setNodePositions(restored.node_positions as Record<string, { x: number; y: number }>);
       }
       setHasUnsavedChanges(false);
+      // Re-materialize sources after checkpoint restore (flow nodes may have changed)
+      api.hyperOpen(actorEmail, currentFlow.flow_id as string).catch(() => {});
       const cps = await api.listCheckpoints(actorEmail, currentFlow.flow_id as string);
       setCheckpoints(cps as unknown as Checkpoint[]);
     } catch (err) {

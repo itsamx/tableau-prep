@@ -52,6 +52,11 @@ class SQLiteConnector(DatabaseConnector):
                     parts.append(f"/* sample rows error: {exc} */")
         return "\n\n".join(parts)
 
+    def get_column_info(self, table: str) -> list[dict]:
+        insp = inspect(self._engine)
+        cols = insp.get_columns(table)
+        return [{"name": c["name"], "type_str": str(c["type"]), "nullable": c.get("nullable", True)} for c in cols]
+
     def check_query(self, sql: str) -> tuple[bool, str]:
         # Block destructive statements
         try:

@@ -126,23 +126,10 @@ export const api = {
     }),
   getActivePlan: (actorEmail: string, flowId: string) =>
     request<PlanVersion>(`/flows/${flowId}/plan`, actorEmail),
-  editPlan: (
-    actorEmail: string,
-    flowId: string,
-    plan: PlanDraft,
-    changeSummary?: string,
-    baseVersionId?: string,
-  ) =>
+  editPlan: (actorEmail: string, flowId: string, plan: PlanDraft, changeSummary?: string, baseVersionId?: string) =>
     request<PlanVersion>(`/flows/${flowId}/plan`, actorEmail, {
       method: "PATCH",
       body: { plan, change_summary: changeSummary, base_version_id: baseVersionId },
-    }),
-  listVersions: (actorEmail: string, flowId: string) =>
-    request<PlanVersion[]>(`/flows/${flowId}/versions`, actorEmail),
-  restoreVersion: (actorEmail: string, flowId: string, versionId: string) =>
-    request<PlanVersion>(`/flows/${flowId}/restore-version`, actorEmail, {
-      method: "POST",
-      body: { version_id: versionId },
     }),
   approvePlan: (actorEmail: string, flowId: string, versionId?: string) => {
     const query = versionId ? `?version_id=${encodeURIComponent(versionId)}` : "";
@@ -221,4 +208,22 @@ export const api = {
 
   latestRun: (actorEmail: string, flowId: string) =>
     request<Record<string, unknown>>(`/flows/${flowId}/run/latest`, actorEmail),
+
+  /** Materialize all source nodes into Hyper for this flow. Call once after flow loads. */
+  hyperOpen: (actorEmail: string, flowId: string) =>
+    request<{ ok: boolean; results: unknown[]; failed: unknown[] }>(
+      `/flows/${flowId}/hyper/open`, actorEmail, { method: "POST" }
+    ),
+
+  /** Get preview rows for a node from Hyper (lazy-materializes ancestors if needed). */
+  hyperNodePreview: (actorEmail: string, flowId: string, nodeId: string, limit = 100) =>
+    request<{ ok: boolean; node_id: string; rows: Record<string, unknown>[]; row_count: number; error?: string }>(
+      `/flows/${flowId}/hyper/${nodeId}/preview?limit=${limit}`, actorEmail
+    ),
+
+  /** Close the Hyper connection for a flow (call on page unload). */
+  hyperClose: (actorEmail: string, flowId: string) =>
+    request<{ ok: boolean; flow_id: string }>(
+      `/flows/${flowId}/hyper`, actorEmail, { method: "DELETE" }
+    ),
 };

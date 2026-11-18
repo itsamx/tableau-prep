@@ -16,6 +16,10 @@ class DatabaseConnector(ABC):
         """Return DDL + 3 sample rows for each requested table."""
         ...
 
+    def get_column_info(self, table: str) -> list[dict]:
+        """Return [{name, type_str, nullable}] for each column. Override in subclasses."""
+        return []
+
     @abstractmethod
     def check_query(self, sql: str) -> tuple[bool, str]:
         """

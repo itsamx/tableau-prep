@@ -45,7 +45,7 @@ from .tools.validation_tools import (
 )
 from .tools.output_tools import (
     tool_generate_flow_json,
-    tool_generate_hyper_extract,
+    tool_materialize_flow_hyper,
 )
 from .store.db import init_db
 from .store.crud import save_flow, save_query_run, save_hyper_extract, get_flow as crud_get_flow, update_flow_nodes, save_checkpoint, list_flows
@@ -153,7 +153,9 @@ def generate_output(
       1. Validates that plan tables exist in the live DB
       2. Validates plan structure (unique IDs, no cycles, output node present)
       3. Generates Flow JSON from the validated plan
-      4. Optionally generates a Tableau Hyper extract from the query rows
+      4. Persists the flow to the SQLite store
+      5. Optionally materializes all source nodes into the flow's Hyper file
+         via HyperManager (same pipeline as the frontend canvas).
 
     Args:
         connection_id: The selected connection (used for table validation).
@@ -164,26 +166,17 @@ def generate_output(
                 "connection_id" – same as the connection_id argument
               Optional but STRONGLY RECOMMENDED:
                 "node_sql"      – per-node SQL map: {node_id: standalone_sql}
-                                  Generate an optimized SQL for EVERY node in the flow:
-                                  • source node  → "SELECT * FROM <table> LIMIT 1000"
-                                  • each transform (clean/rename/filter/aggregate/calculate/sort/join/union)
-                                    → a WITH clause CTE chain covering all steps up to and including
-                                      that node, ending with "SELECT * FROM <last_cte> LIMIT 1000"
-                                  • output node  → same SQL as the final transform node
-                                  This map powers per-node data preview in the frontend when users
-                                  click individual nodes. Without it, preview falls back to a
-                                  frontend-recomputed CTE that may differ from your optimized query.
-        rows: The row list returned by run_query — used for Hyper extract.
+        rows: The row list returned by run_query (persisted as a query run).
         name: Display name for the flow (optional).
-        generate_hyper: Set true to also write a .hyper extract file.
+        generate_hyper: Set true to materialize sources into the flow's Hyper file.
 
     Returns:
         {
           "ok": true,
           "flow_json": {...},
-          "hyper": {"ok": true, "path": "...", "row_count": N}  # only if generate_hyper=true
+          "hyper": {"ok": true, "hyper_path": "...", "results": [...]}  # only if generate_hyper=true
           "validation_errors": [],
-          "frontend_url": "http://localhost:3000/flows/<flow_id>"  # share this link with the user
+          "frontend_url": "http://localhost:3000/flows/<flow_id>"
         }
     """
     errors: list[str] = []
@@ -218,9 +211,14 @@ def generate_output(
         "hyper": None,
     }
 
-    # 4. Optionally generate Hyper extract
+    # 4. Optionally materialize sources into the flow's Hyper file
     if generate_hyper:
-        result["hyper"] = tool_generate_hyper_extract(rows)
+        fj = result["flow_json"]
+        result["hyper"] = tool_materialize_flow_hyper(
+            flow_id=fj["flow_id"],
+            nodes=fj.get("nodes", []),
+            connection_id=fj.get("connection_id", connection_id),
+        )
 
     # 5. Persist to SQLite store so the frontend REST API can read it
     try:
@@ -249,8 +247,8 @@ def generate_output(
         if result.get("hyper") and result["hyper"].get("ok"):
             save_hyper_extract(
                 flow_id=fj["flow_id"],
-                file_path=result["hyper"]["path"],
-                row_count=result["hyper"]["row_count"],
+                file_path=result["hyper"]["hyper_path"],
+                row_count=sum(r.get("row_count", 0) for r in result["hyper"].get("results", []) if r.get("ok")),
             )
         import os
         frontend_base = os.getenv("FRONTEND_URL", "http://localhost:3000")

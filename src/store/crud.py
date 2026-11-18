@@ -9,6 +9,14 @@ from datetime import datetime, timezone
 from .db import get_conn
 
 
+def _stamp_hashes(nodes: list) -> list:
+    """Compute and store hash in each node dict before persisting."""
+    from ..hyper.compiler import compute_node_hash
+    for node in nodes:
+        node["hash"] = compute_node_hash(node)
+    return nodes
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -80,6 +88,7 @@ def update_flow_nodes(
     flow_id: str, nodes: list, edges: list, sql: str,
     node_sql: dict | None = None, node_positions: dict | None = None,
 ) -> dict | None:
+    nodes = _stamp_hashes(nodes)
     conn = get_conn()
     with conn:
         conn.execute(
@@ -119,6 +128,7 @@ def save_checkpoint(
         (flow_id,),
     ).fetchone()
     version = (row["v"] if row else 0) + 1
+    nodes = _stamp_hashes(nodes)
     cp_id = str(uuid.uuid4())
     now = _now()
     with conn:

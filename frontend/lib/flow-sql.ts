@@ -384,7 +384,7 @@ function _handleJoin(
       visited.add(cur.id);
       branchPath.unshift(cur);
       // Don't cross join node boundaries
-      const parentId = (edgesTo[cur.id] || []).find(
+      const parentId: string | undefined = (edgesTo[cur.id] || []).find(
         (pid) => byId[pid] && byId[pid].type !== "join"
       );
       cur = parentId ? byId[parentId] : undefined;

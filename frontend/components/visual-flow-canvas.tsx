@@ -130,7 +130,8 @@ export function VisualFlowCanvas({
   }, [nodes, onPositionsChange]);
 
   const handleNodesChange = useCallback(
-    (changes: NodeChange[]) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (changes: NodeChange<any>[]) => {
       onNodesChange(changes);
       if (changes.some((c) => c.type === "position" && !c.dragging)) {
         dragEndedRef.current = true;

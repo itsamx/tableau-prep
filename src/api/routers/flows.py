@@ -9,7 +9,6 @@ from pydantic import BaseModel
 from ...store import crud
 from ...connectors.registry import get_connector, get_connection_details
 from ...validation.sql import check_sql
-from ...outputs import hyper_extract as hyper_mod
 from ..deps import get_actor
 
 router = APIRouter(prefix="/flows", tags=["flows"])
@@ -75,7 +74,23 @@ def update_flow(flow_id: str, body: PatchFlowBody, actor: str = Depends(get_acto
     flow = crud.get_flow(flow_id)
     if not flow:
         raise HTTPException(status_code=404, detail="Flow not found")
+
+    old_nodes = flow["nodes"]
     updated = crud.update_flow_nodes(flow_id, body.nodes, body.edges, body.sql, body.node_sql, body.node_positions)
+
+    # Trigger hash-based Hyper re-materialisation for changed materialized nodes
+    try:
+        from ...hyper.manager import HyperManager
+        HyperManager.get().sync_changes(
+            flow_id=flow_id,
+            old_nodes=old_nodes,
+            new_nodes=body.nodes,
+            edges=body.edges,
+            connection_id=flow["connection_id"],
+        )
+    except Exception:
+        pass  # Hyper sync is best-effort; never block the PATCH response
+
     return updated
 
 
@@ -158,52 +173,34 @@ def run_flow(flow_id: str, actor: str = Depends(get_actor)):
         return {"ok": False, "run": run, "error": str(exc)}
 
 
-@router.get("/{flow_id}/run/latest")
-def latest_run(flow_id: str, actor: str = Depends(get_actor)):
-    """Return the most recent query run for a flow."""
-    run = crud.latest_query_run(flow_id)
-    if not run:
-        raise HTTPException(status_code=404, detail="No runs found")
-    return run
 
-
-# ── Execute (generate Hyper extract) ────────────────────────────────────────
+# ── Execute (materialize into Hyper via HyperManager) ───────────────────────
 
 @router.post("/{flow_id}/execute")
 def execute_flow(flow_id: str, actor: str = Depends(get_actor)):
     """
-    Run the SQL and generate a Tableau Hyper extract.
-    Uses the latest query run rows if available, otherwise re-runs the SQL.
+    Materialize all source nodes into the flow's Hyper file and persist the
+    extract record. Uses HyperManager — same pipeline as the canvas preview.
     """
     flow = crud.get_flow(flow_id)
     if not flow:
         raise HTTPException(status_code=404, detail="Flow not found")
 
-    # Get rows — re-run if no cached run
-    latest = crud.latest_query_run(flow_id)
-    if latest and latest["status"] == "ok" and latest["rows"]:
-        rows = latest["rows"]
-    else:
-        # Run fresh
-        run_result = run_flow(flow_id, actor)
-        if not run_result.get("ok"):
-            return run_result
-        rows = run_result["rows"]
+    from ...hyper.manager import HyperManager
+    mgr = HyperManager.get()
+    result = mgr.materialize_all_sources(
+        flow_id=flow_id,
+        nodes=flow["nodes"],
+        connection_id=flow["connection_id"],
+    )
 
-    # Generate Hyper
-    import os
-    from datetime import datetime, timezone
-    output_dir = os.getenv("HYPER_OUTPUT_DIR", "outputs/hyper")
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    output_path = os.path.join(output_dir, f"{flow_id[:8]}_{ts}.hyper")
-    hyper_result = hyper_mod.generate_hyper(rows, output_path)
-
-    if hyper_result.get("ok"):
+    if result.get("ok"):
+        row_count = sum(r.get("row_count", 0) for r in result.get("results", []) if r.get("ok"))
         extract = crud.save_hyper_extract(
             flow_id,
-            hyper_result["path"],
-            hyper_result["row_count"],
+            str(mgr.hyper_path(flow_id)),
+            row_count,
         )
-        return {"ok": True, "hyper": extract, "row_count": hyper_result["row_count"]}
+        return {"ok": True, "hyper": extract, "row_count": row_count}
     else:
-        return {"ok": False, "error": hyper_result.get("error")}
+        return {"ok": False, "error": result.get("failed")}

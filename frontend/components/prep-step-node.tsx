@@ -17,6 +17,7 @@ import {
   Calculator,
   Plus,
   Sigma,
+  Play,
 } from "lucide-react";
 
 interface StepStyleConfig {
@@ -130,11 +131,98 @@ function PrepStepNodeComponent({ data, selected }: NodeProps) {
   const nodeData = data as unknown as PrepNodeData;
   const isSource = nodeData.type === "source";
   const isOutput = nodeData.type === "output";
+  const isFold = nodeData.isFold === true;
   const style = getTableauStyle(nodeData.type);
   const [showAddMenu, setShowAddMenu] = useState(false);
 
   const changesCount = nodeData.changesCount ?? 1;
 
+  // ── Compact fold node (filter / clean / calculate / sort / rename) ──────────
+  if (isFold) {
+    return (
+      <div className="relative group">
+        <div
+          className={`w-[160px] bg-white rounded-full shadow-sm border-2 transition-all duration-200 cursor-pointer overflow-hidden ${
+            selected
+              ? `ring-2 ring-blue-400 ${style.borderColor} shadow-md`
+              : `${style.borderColor} hover:shadow-md`
+          }`}
+        >
+          <Handle
+            type="target"
+            position={Position.Left}
+            className="w-2 h-2 bg-slate-400 border border-white hover:scale-125 transition-transform"
+          />
+
+          <div className={`px-3 py-1.5 ${style.headerBg} flex items-center gap-1.5`}>
+            {getTableauIcon(nodeData.type)}
+            <span className="text-[11px] font-bold text-white truncate capitalize flex-1">
+              {nodeData.type}
+            </span>
+            {nodeData.onDeleteStep && (
+              <button
+                type="button"
+                onClick={(e) => { e.stopPropagation(); nodeData.onDeleteStep?.(nodeData.alias); }}
+                title="Delete this step"
+                className="p-0.5 rounded text-white/70 hover:text-white hover:bg-white/20 transition-colors cursor-pointer"
+              >
+                <Trash2 className="w-3 h-3" />
+              </button>
+            )}
+          </div>
+
+          <div className="px-3 py-1 bg-white">
+            <p className="text-[10px] text-slate-500 truncate leading-tight" title={nodeData.description}>
+              {nodeData.description || "Fold step"}
+            </p>
+          </div>
+
+          <Handle
+            type="source"
+            position={Position.Right}
+            className="w-2 h-2 bg-slate-400 border border-white hover:scale-125 transition-transform"
+          />
+        </div>
+
+        {/* "+" button */}
+        <div className="absolute right-[-14px] top-1/2 -translate-y-1/2 z-30 opacity-0 group-hover:opacity-100 transition-opacity">
+          <button
+            type="button"
+            onClick={(e) => { e.stopPropagation(); setShowAddMenu((p) => !p); }}
+            title="Add a step"
+            className="w-5 h-5 rounded-full bg-blue-600 hover:bg-blue-700 text-white flex items-center justify-center shadow-md border-2 border-white cursor-pointer hover:scale-110 transition-all"
+          >
+            <Plus className="w-3 h-3 stroke-[2.5]" />
+          </button>
+          {showAddMenu && (
+            <div
+              className="absolute left-7 top-1/2 -translate-y-1/2 w-44 bg-white rounded-lg shadow-xl border border-slate-200 py-1.5 z-50 text-xs animate-in fade-in zoom-in-95 duration-150"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="px-3 py-1 text-[10px] font-bold text-slate-400 uppercase tracking-wider border-b border-slate-100 mb-1">
+                Insert Step
+              </div>
+              {["clean", "filter", "calculate", "sort", "aggregate", "join"].map((t) => (
+                <button
+                  key={t}
+                  type="button"
+                  onClick={() => { setShowAddMenu(false); nodeData.onAddStep?.(nodeData.alias, t); }}
+                  className="w-full text-left px-3 py-1.5 hover:bg-slate-50 flex items-center gap-2 text-slate-700 cursor-pointer capitalize"
+                >
+                  <div className={`w-3.5 h-3.5 rounded flex items-center justify-center ${getTableauStyle(t).headerBg}`}>
+                    {getTableauIcon(t)}
+                  </div>
+                  <span>{t.charAt(0).toUpperCase() + t.slice(1)}</span>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // ── Full MAT node (source / join / union / aggregate / output) ──────────────
   return (
     <div className="relative group">
       <div
@@ -200,6 +288,20 @@ function PrepStepNodeComponent({ data, selected }: NodeProps) {
           <p className="text-[11px] text-slate-500 line-clamp-2 leading-relaxed" title={nodeData.description}>
             {nodeData.description || "Transformation step"}
           </p>
+
+          {isOutput && nodeData.onRun && (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                nodeData.onRun?.(nodeData.alias);
+              }}
+              className="mt-2 w-full flex items-center justify-center gap-1.5 px-3 py-1.5 text-[11px] font-semibold bg-slate-900 hover:bg-slate-700 text-white rounded-md transition-colors cursor-pointer"
+            >
+              <Play className="w-3 h-3 fill-current" />
+              Run
+            </button>
+          )}
         </div>
 
         {/* Source handle (right) - for downstream connection */}

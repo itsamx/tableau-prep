@@ -58,6 +58,12 @@ def node_preview(flow_id: str, node_id: str, limit: int = 100):
     nbi = nodes_by_id(flow["nodes"])
     node = nbi.get(node_id)
     if not node:
+        # Fallback: find source node whose table matches node_id (handles table-name aliases)
+        node = next(
+            (n for n in flow["nodes"] if n.get("type") == "source" and n.get("table") == node_id),
+            None,
+        )
+    if not node:
         raise HTTPException(status_code=404, detail=f"Node {node_id!r} not found in flow")
 
     mgr = HyperManager.get()

@@ -1,7 +1,50 @@
 import { Node, Edge } from "@xyflow/react";
 import type { PlanDraft, PlanStep, SourceTableRef } from "@/lib/types";
+import type { FoldBadgeInfo } from "@/components/prep-flow-edge";
 
 // ── Types for our backend's native nodes/edges format ────────────────────────
+
+// Fold node types — hidden from canvas, shown as edge annotation badges.
+// Matches FOLD_TYPES in src/hyper/compiler.py (minus "output" which stays on canvas).
+const FOLD_BADGE_TYPES = new Set(["filter", "sort", "clean", "calculate", "rename"]);
+
+function _foldBadgeLabel(n: BackendNode): string {
+  if (n.type === "filter") return "Filter";
+  if (n.type === "calculate") return n.alias ? `Calc: ${String(n.alias).slice(0, 10)}` : "Calc";
+  if (n.type === "sort") return "Sort";
+  if (n.type === "clean") return "Clean";
+  if (n.type === "rename") return "Rename";
+  return n.type;
+}
+
+function _foldBadgeDesc(n: BackendNode): string {
+  if (n.type === "filter") return n.condition ? `WHERE ${String(n.condition).slice(0, 60)}` : "Filter step";
+  if (n.type === "calculate") return `${n.alias ?? ""} = ${String(n.expression ?? "").slice(0, 40)}`;
+  if (n.type === "sort") return "Sort step";
+  if (n.type === "clean") {
+    const ops = (n as Record<string, unknown>).operations as any[] | undefined ?? [];
+    return ops.length ? `${ops.length} op(s): ${ops.map((o: any) => o.op).join(", ")}` : "Clean step";
+  }
+  if (n.type === "rename") return `Rename: ${Object.keys(n.mappings ?? {}).slice(0, 2).join(", ")}`;
+  return n.type;
+}
+
+// Walks backward from startId through fold nodes until reaching the nearest
+// materialized (non-fold) node. Returns that MAT node + the fold chain.
+function _traceToMat(
+  startId: string,
+  nbi: Record<string, BackendNode>,
+): { mat: BackendNode | null; folds: BackendNode[] } {
+  const foldsReversed: BackendNode[] = [];
+  let current: BackendNode | undefined = nbi[startId];
+  while (current && FOLD_BADGE_TYPES.has(current.type)) {
+    foldsReversed.push(current);
+    const parentId = current.input as string | undefined;
+    if (!parentId || !nbi[parentId]) return { mat: null, folds: [] };
+    current = nbi[parentId];
+  }
+  return { mat: current ?? null, folds: foldsReversed.reverse() };
+}
 
 export interface BackendNode {
   id: string;
@@ -42,58 +85,143 @@ export function backendFlowToGraph(
 
   const startX = 50;
   const startY = 80;
-  const colWidth = 270;
-  const rowHeight = 110;
+  const MAT_COL_WIDTH = 300; // base MAT-to-MAT distance
+  const FOLD_SLOT = 110;     // minimum pixels per fold node slot
+  const rowHeight = 115;
 
-  // Assign x position based on BFS depth from source nodes
-  const depthMap: Record<string, number> = {};
-  const sourceNodes = flow.nodes.filter((n) => n.type === "source");
-  sourceNodes.forEach((n) => { depthMap[n.id] = 0; });
+  // ── Index all nodes ──────────────────────────────────────────────────────────
+  const nbi: Record<string, BackendNode> = {};
+  flow.nodes.forEach((n) => { nbi[n.id] = n; });
 
-  // Simple depth assignment — each non-source node is 1 deeper than its input
+  // ── MAT-layer depth (fold nodes are transparent) ─────────────────────────────
+  const matDepth: Record<string, number> = {};
+  flow.nodes.filter((n) => n.type === "source").forEach((n) => { matDepth[n.id] = 0; });
+
   let changed = true;
   while (changed) {
     changed = false;
     flow.nodes.forEach((n) => {
-      if (n.type === "source") return;
-      const inputs = [n.input, n.left_input, n.right_input, ...(n.inputs || [])]
+      if (n.type === "source" || FOLD_BADGE_TYPES.has(n.type)) return;
+      const inputIds = [n.input, n.left_input, n.right_input, ...(n.inputs ?? [])]
         .filter(Boolean) as string[];
-      const maxParentDepth = Math.max(-1, ...inputs.map((i) => depthMap[i] ?? -1));
-      if (maxParentDepth >= 0) {
-        const desired = maxParentDepth + 1;
-        if ((depthMap[n.id] ?? -1) < desired) {
-          depthMap[n.id] = desired;
+      const matAncestorDepths = inputIds.map((id) => {
+        const { mat } = _traceToMat(id, nbi);
+        return mat ? (matDepth[mat.id] ?? -1) : -1;
+      });
+      const maxD = Math.max(-1, ...matAncestorDepths);
+      if (maxD >= 0) {
+        const desired = maxD + 1;
+        if ((matDepth[n.id] ?? -1) < desired) {
+          matDepth[n.id] = desired;
           changed = true;
         }
       }
     });
   }
 
-  // Y position: stack same-depth nodes vertically
-  const yCounters: Record<number, number> = {};
-  const posMap: Record<string, { x: number; y: number }> = {};
+  // ── MAT node Y (stack same-depth) ────────────────────────────────────────────
+  const matYCounters: Record<number, number> = {};
+  const matYPos: Record<string, number> = {};
   flow.nodes.forEach((n) => {
-    const depth = depthMap[n.id] ?? 0;
-    const yIdx = yCounters[depth] ?? 0;
-    yCounters[depth] = yIdx + 1;
-    posMap[n.id] = { x: startX + depth * colWidth, y: startY + yIdx * rowHeight };
+    if (FOLD_BADGE_TYPES.has(n.type) || n.type === "output") return;
+    const depth = matDepth[n.id] ?? 0;
+    const yIdx = matYCounters[depth] ?? 0;
+    matYCounters[depth] = yIdx + 1;
+    matYPos[n.id] = startY + yIdx * rowHeight;
   });
 
-  // Build React Flow nodes
+  // ── MAT node X — edge length expands when fold nodes need room ───────────────
+  // Traverse in topological order: sources first, then each MAT node after its
+  // upstream MAT ancestor is positioned.
+  const matXPos: Record<string, number> = {};
+  flow.nodes.filter((n) => n.type === "source").forEach((n) => { matXPos[n.id] = startX; });
+
+  let matChanged = true;
+  while (matChanged) {
+    matChanged = false;
+    flow.nodes.forEach((n) => {
+      if (n.type === "source" || FOLD_BADGE_TYPES.has(n.type) || n.type === "output") return;
+      const inputIds = [n.input, n.left_input, n.right_input, ...(n.inputs ?? [])]
+        .filter(Boolean) as string[];
+      for (const inputId of inputIds) {
+        const { mat: upMat, folds } = _traceToMat(inputId, nbi);
+        if (!upMat || !(upMat.id in matXPos)) continue;
+        // Edge length = max of base width and fold-driven minimum
+        const edgeLen = Math.max(MAT_COL_WIDTH, (folds.length + 1) * FOLD_SLOT + 80);
+        const candidateX = matXPos[upMat.id] + edgeLen;
+        if ((matXPos[n.id] ?? 0) < candidateX) {
+          matXPos[n.id] = candidateX;
+          matChanged = true;
+        }
+      }
+    });
+  }
+
+  // ── Build fold chain info (which MAT nodes bracket each fold node) ───────────
+  interface FoldInfo { upMat: BackendNode; downMat: BackendNode; chainIdx: number; chainLen: number }
+  const foldInfo: Record<string, FoldInfo> = {};
+
   flow.nodes.forEach((n) => {
-    if (n.type === "output") return; // rendered via output node below
+    if (FOLD_BADGE_TYPES.has(n.type) || n.type === "output") return;
+    const inputIds = [n.input, n.left_input, n.right_input, ...(n.inputs ?? [])]
+      .filter(Boolean) as string[];
+    inputIds.forEach((inputId) => {
+      const { mat: upMat, folds } = _traceToMat(inputId, nbi);
+      if (!upMat) return;
+      folds.forEach((fold, idx) => {
+        foldInfo[fold.id] = { upMat, downMat: n, chainIdx: idx, chainLen: folds.length };
+      });
+    });
+  });
+
+  // ── Fold node positions ───────────────────────────────────────────────────────
+  const foldXPos: Record<string, number> = {};
+  const foldYPos: Record<string, number> = {};
+
+  flow.nodes.forEach((n) => {
+    if (!FOLD_BADGE_TYPES.has(n.type)) return;
+    const info = foldInfo[n.id];
+    if (info) {
+      // Fold sits between two MAT nodes — distribute evenly
+      const x1 = matXPos[info.upMat.id] ?? startX;
+      const x2 = matXPos[info.downMat.id] ?? (startX + MAT_COL_WIDTH);
+      const y1 = matYPos[info.upMat.id] ?? startY;
+      foldXPos[n.id] = x1 + (info.chainIdx + 1) * (x2 - x1) / (info.chainLen + 1);
+      foldYPos[n.id] = y1;
+    } else {
+      // Terminal fold — no downstream MAT yet; position after upstream MAT
+      const { mat: upMat, folds: allFolds } = _traceToMat(n.id, nbi);
+      const myIdx = allFolds.findIndex((f) => f.id === n.id);
+      foldXPos[n.id] = (upMat ? (matXPos[upMat.id] ?? startX) : startX) + (myIdx + 1) * FOLD_SLOT;
+      foldYPos[n.id] = upMat ? (matYPos[upMat.id] ?? startY) : startY;
+    }
+  });
+
+  // ── Combined posMap for all non-output nodes ──────────────────────────────────
+  const posMap: Record<string, { x: number; y: number }> = {};
+  flow.nodes.forEach((n) => {
+    if (FOLD_BADGE_TYPES.has(n.type)) {
+      posMap[n.id] = { x: foldXPos[n.id] ?? startX, y: foldYPos[n.id] ?? startY };
+    } else {
+      posMap[n.id] = { x: matXPos[n.id] ?? startX, y: matYPos[n.id] ?? startY };
+    }
+  });
+
+  // Build canvas nodes — all node types visible (fold nodes shown with compact style)
+  flow.nodes.forEach((n) => {
+    if (n.type === "output") return; // rendered separately below
 
     const pos = savedPositions?.[n.id] ?? posMap[n.id] ?? { x: startX, y: startY };
     const style = STEP_COLORS[n.type] ?? STEP_COLORS.filter;
 
-    let label = n.type === "source" ? (n.table ?? n.id) : n.id;
+    const label = n.type === "source" ? (n.table ?? n.id) : n.id;
     let description = "";
     if (n.type === "source") description = n.table ?? "";
-    else if (n.type === "filter") description = n.condition ? `WHERE ${n.condition.slice(0, 60)}` : "Filter step";
+    else if (n.type === "filter") description = n.condition ? `WHERE ${String(n.condition).slice(0, 60)}` : "Filter step";
     else if (n.type === "join") description = `${((n as any).join_type ?? "INNER").toUpperCase()} JOIN`;
     else if (n.type === "aggregate") description = `GROUP BY ${(n.group_by ?? []).join(", ") || "all"}`;
     else if (n.type === "rename") description = `Rename: ${Object.keys(n.mappings ?? {}).slice(0, 2).join(", ")}`;
-    else if (n.type === "calculate") description = `Calc: ${n.alias ?? ""} = ${(n.expression ?? "").slice(0, 40)}`;
+    else if (n.type === "calculate") description = `Calc: ${n.alias ?? ""} = ${String(n.expression ?? "").slice(0, 40)}`;
     else if (n.type === "sort") description = "Sort step";
     else if (n.type === "union") description = `Stack ${(n.inputs ?? []).length} inputs`;
     else if (n.type === "clean") {
@@ -114,6 +242,8 @@ export function backendFlowToGraph(
         badgeColor: style.badge,
         changesCount: _changesCount(n),
         details: n as unknown as Record<string, unknown>,
+        // isFold signals the node renderer to use compact styling
+        isFold: FOLD_BADGE_TYPES.has(n.type),
       },
     });
   });
@@ -123,8 +253,7 @@ export function backendFlowToGraph(
   if (outputNode) {
     const parentId = outputNode.input ?? flow.nodes[flow.nodes.length - 2]?.id;
     const parentPos = posMap[parentId ?? ""] ?? { x: startX, y: startY };
-    const depth = (depthMap[parentId ?? ""] ?? 0) + 1;
-    const outputPos = savedPositions?.[outputNode.id] ?? { x: startX + depth * colWidth, y: parentPos.y };
+    const outputPos = savedPositions?.[outputNode.id] ?? { x: parentPos.x + MAT_COL_WIDTH, y: parentPos.y };
     rfNodes.push({
       id: outputNode.id,
       type: "prepStep",
@@ -140,7 +269,7 @@ export function backendFlowToGraph(
     });
   }
 
-  // Build React Flow edges from backend edges
+  // Build edges from backend edge list — all nodes are on canvas so no fold-chain collapsing needed
   flow.edges.forEach((e, idx) => {
     const target = e.to;
     if (!rfNodes.find((n) => n.id === e.from) || !rfNodes.find((n) => n.id === target)) return;
@@ -151,6 +280,7 @@ export function backendFlowToGraph(
       type: "prepEdge",
       animated: true,
       style: { stroke: "#6366f1", strokeWidth: 2 },
+      data: {},
     });
   });
 
@@ -175,8 +305,10 @@ export interface PrepNodeData extends Record<string, unknown> {
   columnsCount?: number;
   changesCount?: number;
   isSelected?: boolean;
+  isFold?: boolean;
   onDeleteStep?: (alias: string) => void;
   onAddStep?: (sourceAlias: string, stepType?: string) => void;
+  onRun?: (nodeId: string) => void;
 }
 
 const STEP_COLORS: Record<string, { bg: string; border: string; text: string; badge: string; headerBg: string }> = {

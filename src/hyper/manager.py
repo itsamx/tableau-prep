@@ -261,6 +261,47 @@ class HyperManager:
         self._dirty.get(flow_id, set()).discard(node_id)
         return {"ok": True, "node_id": node_id, "table": table_name, "row_count": len(rows)}
 
+    # ── Join column deduplication ─────────────────────────────────────────────
+
+    def _resolve_join_columns(self, conn: Any, node: dict, nbi: dict[str, dict]) -> str | None:
+        """
+        Returns an explicit SELECT column list for a join that renames right-side
+        columns that clash with left-side columns (appends '_right' suffix).
+        Returns None if schema introspection fails (caller keeps l.*, r.*).
+        """
+        from .compiler import resolve_upstream_mat, fuse_folds_sql, materialized_ref
+
+        left_mat, left_folds = resolve_upstream_mat(node.get("left_input"), nbi)
+        right_mat, right_folds = resolve_upstream_mat(node.get("right_input"), nbi)
+        if not left_mat or not right_mat:
+            return None
+
+        def _cols(mat_node: dict, folds: list) -> list[str] | None:
+            if folds:
+                sql = fuse_folds_sql(mat_node, folds) + " LIMIT 0"
+            else:
+                sql = f"SELECT * FROM {materialized_ref(mat_node)} LIMIT 0"
+            try:
+                with conn.execute_query(sql) as result:
+                    return [c.name.unescaped for c in result.schema.columns]
+            except Exception:
+                return None
+
+        left_cols = _cols(left_mat, left_folds)
+        right_cols = _cols(right_mat, right_folds)
+        if not left_cols or not right_cols:
+            return None
+
+        left_set = set(left_cols)
+        left_select = ", ".join(f'l."{c}"' for c in left_cols)
+        right_parts: list[str] = []
+        for c in right_cols:
+            if c in left_set:
+                right_parts.append(f'r."{c}" AS "{c}_right"')
+            else:
+                right_parts.append(f'r."{c}"')
+        return f"{left_select}, {', '.join(right_parts)}"
+
     # ── Transform materialisation (Hyper → Hyper "materialized") ─────────────
 
     def _materialize_transform(self, flow_id: str, node: dict, nbi: dict[str, dict]) -> dict:
@@ -277,6 +318,13 @@ class HyperManager:
             select_sql = compile_materialized(node, nbi)
         except Exception as exc:
             return {"ok": False, "node_id": node_id, "error": f"Compile error: {exc}"}
+
+        # Resolve duplicate column names in join output before writing to Hyper
+        if node.get("type") == "join":
+            explicit_cols = self._resolve_join_columns(conn, node, nbi)
+            if explicit_cols:
+                select_sql = select_sql.replace("l.*, r.*", explicit_cols)
+                log.debug("join dedup cols node=%s cols=%s", node_id, explicit_cols[:120])
 
         self._drop_table(conn, "materialized", node_id)
         try:

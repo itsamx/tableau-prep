@@ -1,10 +1,13 @@
 """Flow endpoints — CRUD, checkpoints, run, execute."""
 from __future__ import annotations
 
+import logging
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
+
+log = logging.getLogger(__name__)
 
 from ...store import crud
 from ...connectors.registry import get_connector, get_connection_details
@@ -35,6 +38,10 @@ class CheckpointBody(BaseModel):
     node_sql: dict = {}
     node_positions: dict = {}
     change_summary: str | None = None
+
+
+class RunFlowBody(BaseModel):
+    node_id: str | None = None
 
 
 # ── Flow CRUD ────────────────────────────────────────────────────────────────
@@ -132,23 +139,77 @@ def restore_checkpoint(flow_id: str, cp_id: str, actor: str = Depends(get_actor)
 # ── Run (execute SQL, store results) ────────────────────────────────────────
 
 @router.post("/{flow_id}/run")
-def run_flow(flow_id: str, actor: str = Depends(get_actor)):
+def run_flow(flow_id: str, body: RunFlowBody = RunFlowBody(), actor: str = Depends(get_actor)):
     """
-    Validate and execute the flow's SQL against the live database.
-    Stores results in query_runs table.
+    Run the flow using Hyper-first fold fusion.
+    If Hyper is unavailable or fails, falls back to the stored CTE SQL against live DB.
+
+    Hyper path:
+      - Finds the output/terminal node.
+      - Calls HyperManager.get_preview which auto-fetches source data from live DB
+        into Hyper if missing, then executes the fold-fused SELECT.
+    Fallback:
+      - Uses flow["sql"] (CTE accumulator) against the live DB connection.
     """
     flow = crud.get_flow(flow_id)
     if not flow:
         raise HTTPException(status_code=404, detail="Flow not found")
 
-    sql = flow["sql"]
+    nodes = flow.get("nodes", [])
+    connection_id = flow["connection_id"]
+    row_limit = 1000
+
+    # ── Hyper-first path ──────────────────────────────────────────────────────
+    if nodes:
+        try:
+            from ...hyper.manager import HyperManager
+            from ...hyper.compiler import nodes_by_id as _nbi
+
+            nbi = _nbi(nodes)
+
+            # Use specific node_id from request if provided, else find output/terminal
+            if body.node_id and body.node_id in nbi:
+                terminal = nbi[body.node_id]
+            else:
+                terminal = next((n for n in nodes if n.get("type") == "output"), None)
+            if not terminal:
+                all_inputs: set[str] = set()
+                for n in nodes:
+                    for key in ("input", "left_input", "right_input"):
+                        if n.get(key):
+                            all_inputs.add(n[key])
+                    all_inputs.update(n.get("inputs", []))
+                terminal = next((n for n in nodes if n["id"] not in all_inputs), None)
+
+            if terminal:
+                mgr = HyperManager.get()
+                result = mgr.get_preview(
+                    flow_id=flow_id,
+                    node=terminal,
+                    nbi=nbi,
+                    connection_id=connection_id,
+                    limit=row_limit,
+                )
+                if result.get("ok"):
+                    rows = result["rows"]
+                    run = crud.save_query_run(
+                        flow_id, "(hyper-fused)", rows, len(rows), status="ok"
+                    )
+                    return {"ok": True, "run": run, "rows": rows, "row_count": len(rows)}
+                else:
+                    log.warning(
+                        "hyper run failed flow=%s node=%s error=%s — falling back to live DB",
+                        flow_id, terminal.get("id"), result.get("error"),
+                    )
+        except Exception as exc:
+            log.warning("hyper run exception flow=%s: %s — falling back to live DB", flow_id, exc)
+
+    # ── Live DB fallback (CTE SQL stored at checkpoint) ───────────────────────
+    sql = flow.get("sql", "")
     if not sql or not sql.strip():
         return {"ok": False, "run": None,
                 "error": "No SQL for this flow. Add a table to the canvas first."}
 
-    connection_id = flow["connection_id"]
-
-    # sqlglot check
     details = get_connection_details(connection_id)
     dialect_map = {"sqlite": "sqlite", "mysql": "mysql", "postgresql": "postgres"}
     dialect = dialect_map.get(details.get("type", "sqlite"), "sqlite")
@@ -161,8 +222,6 @@ def run_flow(flow_id: str, actor: str = Depends(get_actor)):
         )
         return {"ok": False, "run": run, "error": check["report"]}
 
-    # Execute
-    row_limit = 1000
     try:
         with get_connector(connection_id) as conn:
             rows = conn.execute_query(check["corrected_sql"], row_limit=row_limit)

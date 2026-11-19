@@ -187,9 +187,9 @@ export const api = {
   updateFlow: (actorEmail: string, flowId: string, payload: { nodes: unknown[]; edges: unknown[]; sql: string; node_sql?: Record<string, string>; node_positions?: Record<string, { x: number; y: number }> }) =>
     request<Record<string, unknown>>(`/flows/${flowId}`, actorEmail, { method: "PATCH", body: payload }),
 
-  runBackendFlow: (actorEmail: string, flowId: string) =>
+  runBackendFlow: (actorEmail: string, flowId: string, nodeId?: string) =>
     request<{ ok: boolean; run: Record<string, unknown>; rows?: Record<string, unknown>[]; row_count?: number; error?: string }>(
-      `/flows/${flowId}/run`, actorEmail, { method: "POST" }
+      `/flows/${flowId}/run`, actorEmail, { method: "POST", body: nodeId ? { node_id: nodeId } : undefined }
     ),
 
   executeBackendFlow: (actorEmail: string, flowId: string) =>

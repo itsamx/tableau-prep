@@ -342,14 +342,14 @@ function FlowStudioContent() {
       await ensureFlow(tableName);
       const nodeId = `source_${tableName.toLowerCase().replace(/\W/g, "_")}`;
       if (nodes.find((n) => n.id === nodeId)) {
-        handleNodeSelect({ label: tableName, type: "source", alias: tableName.toLowerCase(), description: `${schemaName}.${tableName}` } as PrepNodeData);
+        handleNodeSelect({ label: tableName, type: "source", alias: nodeId, description: `${schemaName}.${tableName}`, details: { schema: schemaName, table: tableName } } as PrepNodeData);
         return;
       }
       const newNode: BackendNode = { id: nodeId, type: "source", table: tableName, name: tableName, alias: tableName.toLowerCase() };
       setNodes((prev) => [...prev, newNode]);
       canvasEdited.current = true;
       setHasUnsavedChanges(true);
-      handleNodeSelect({ label: tableName, type: "source", alias: tableName.toLowerCase(), description: `${schemaName}.${tableName}`, details: { schema: schemaName, table: tableName } } as PrepNodeData);
+      handleNodeSelect({ label: tableName, type: "source", alias: nodeId, description: `${schemaName}.${tableName}`, details: { schema: schemaName, table: tableName } } as PrepNodeData);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Failed to add table");
     }
@@ -710,20 +710,19 @@ function FlowStudioContent() {
     setSql(result.sql);
   }, [nodes, edges]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Run flow ──────────────────────────────────────────────────────────────
+  // ── Run flow (triggered from output node) ────────────────────────────────
 
-  async function handleRunFlow() {
+  async function handleRunFromNode(nodeId: string) {
     if (!currentFlow) return;
     setIsRunning(true);
     setError(null);
     setPublishSuccess(null);
     try {
-      // Auto-save unsaved changes before running
       if (hasUnsavedChanges) {
         await api.updateFlow(actorEmail, currentFlow.flow_id as string, { nodes, edges, sql, node_sql: nodeSQL, node_positions: nodePositions });
         setHasUnsavedChanges(false);
       }
-      const result = await api.runBackendFlow(actorEmail, currentFlow.flow_id as string);
+      const result = await api.runBackendFlow(actorEmail, currentFlow.flow_id as string, nodeId);
       if (!result.ok) {
         setError(result.error || "Run failed");
         return;
@@ -734,7 +733,7 @@ function FlowStudioContent() {
         setSelectedNode({
           label: "Output (Transformed Data)",
           type: "output",
-          alias: "output",
+          alias: nodeId,
           description: `${result.row_count ?? rows.length} rows produced`,
         } as PrepNodeData);
         setTimeout(() => previewDrawerRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 100);
@@ -858,18 +857,6 @@ function FlowStudioContent() {
               History
             </button>
           )}
-
-          {/* Run */}
-          <button
-            onClick={handleRunFlow}
-            disabled={!currentFlow || isRunning || isFlowLoading}
-            className="flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold bg-slate-900 hover:bg-slate-800 text-white rounded-lg disabled:opacity-40 transition-all cursor-pointer shadow-sm"
-          >
-            {isRunning || isFlowLoading
-              ? <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-              : <Play className="w-3.5 h-3.5 fill-current" />}
-            {isFlowLoading ? "Loading..." : isRunning ? "Running..." : "Run Flow"}
-          </button>
 
           {/* Export CSV */}
           <button
@@ -1038,6 +1025,7 @@ function FlowStudioContent() {
                 onAddStepOnEdge={handleAddStepOnEdge}
                 onAddStepFromNode={handleAddStepFromNode}
                 onDeleteStep={(alias) => setPendingDeleteAlias(alias)}
+                onNodeRun={handleRunFromNode}
                 onPositionsChange={handlePositionsChange}
                 className="h-[460px]"
               />

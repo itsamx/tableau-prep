@@ -16,7 +16,7 @@ import "@xyflow/react/dist/style.css";
 import type { PlanDraft } from "@/lib/types";
 import { planToFlowGraph, backendFlowToGraph, PrepNodeData, BackendFlow } from "@/lib/plan-to-graph";
 import { PrepStepNode } from "@/components/prep-step-node";
-import { PrepFlowEdge } from "@/components/prep-flow-edge";
+import { PrepFlowEdge, type FoldBadgeInfo } from "@/components/prep-flow-edge";
 
 const ZOOM_LEVELS = [1.0, 1.25, 1.5] as const;
 
@@ -68,6 +68,7 @@ export interface VisualFlowCanvasProps {
   onAddStepOnEdge?: (sourceAlias: string, targetAlias: string) => void;
   onAddStepFromNode?: (sourceAlias: string, stepType?: string) => void;
   onDeleteStep?: (alias: string) => void;
+  onNodeRun?: (nodeId: string) => void;
   onPositionsChange?: (positions: Record<string, { x: number; y: number }>) => void;
   className?: string;
 }
@@ -82,6 +83,7 @@ export function VisualFlowCanvas({
   onAddStepOnEdge,
   onAddStepFromNode,
   onDeleteStep,
+  onNodeRun,
   onPositionsChange,
   className = "h-[440px]",
 }: VisualFlowCanvasProps) {
@@ -96,18 +98,29 @@ export function VisualFlowCanvas({
         ...n.data,
         onDeleteStep: onDeleteStep ? (alias: string) => onDeleteStep(alias) : undefined,
         onAddStep: (src: string, stepType?: string) => onAddStepFromNode?.(src, stepType),
+        onRun: onNodeRun ? (nodeId: string) => onNodeRun(nodeId) : undefined,
       },
     }));
-    // Inject onAddStep handler into custom edges
+    // Inject handlers into custom edges
     const edgesWithHandler = edges.map((e) => ({
       ...e,
       data: {
         ...(e.data || {}),
         onAddStep: (src: string, tgt: string) => onAddStepOnEdge?.(src, tgt),
+        onFoldClick: (badge: FoldBadgeInfo) => {
+          // Surface fold badge click as a node-select so the profiler pane opens
+          onNodeSelect?.({
+            label: badge.label,
+            type: badge.type,
+            alias: badge.id,
+            description: badge.description,
+            details: badge.details,
+          });
+        },
       },
     }));
     return { initialNodes: nodesWithHandler, initialEdges: edgesWithHandler };
-  }, [plan, onAddStepOnEdge, onAddStepFromNode, onDeleteStep]);
+  }, [plan, onAddStepOnEdge, onAddStepFromNode, onDeleteStep, onNodeRun]);
 
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
